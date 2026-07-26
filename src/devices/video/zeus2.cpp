@@ -1715,10 +1715,15 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	float xOrigin = reinterpret_cast<float&>(m_state->m_zeusbase[0x6a]);
 	float yOrigin = reinterpret_cast<float&>(m_state->m_zeusbase[0x6b]);
 
-	// crusn seems to use a different z scale
+	// Not a z scale: zRound is the value that makes a game's 2D pass (identity matrix, constant z)
+	// project at unity - crusnexo runs that pass at [6c]=1, z=0 so it needs 2, thegrid at [6c]=0,
+	// z=0.5 so it needs 0.5, and [6c] is the only register that differs between a game's 2D and 3D
+	// pass. Known wrong: both games also run their 3D pass at [6c]=9, under microcode that is
+	// bit-identical across the two, so one constant per game cannot be right - it should key off
+	// [6c]. Left as-is because the value at [6c]=9 is still unknown and moving it changes a game.
 	float zRound = (m_state->m_system == m_state->CRUSNEXO) ? 2.0f : 0.5f;
 
-	float oozBase = 1 << m_state->m_zeusbase[0x6c];
+	float oozBase = 1 << (m_state->m_zeusbase[0x6c] & 0x1f);
 	for (int i = 0; i < numverts; i++)
 	{
 		// Clamp to zero if negative
