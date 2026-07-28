@@ -22,7 +22,7 @@
 *  Constructor
 *************************************/
 zeus2_renderer::zeus2_renderer(zeus2_device *state)
-	: poly_manager<float, zeus2_poly_extra_data, 4>(state->machine())
+	: poly_manager<float, zeus2_poly_extra_data, 3>(state->machine())
 	, m_state(state)
 {
 }
@@ -1687,9 +1687,6 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		vert[i].p[2] += (texdata >> 16);
 		vert[i].p[1] *= 256.0f;
 		vert[i].p[2] *= 256.0f;
-		vert[i].p[3] = 0.0f;
-
-
 
 		if (logextra & logit)
 		{
@@ -1708,7 +1705,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	// crusnexo road segment), matching the Zeus 1 renderer.
 	float clipVal = reinterpret_cast<float&>(m_state->m_zeusbase[0x78]);
 	z2_poly_vertex clipvert[8];
-	int numverts = zclip_if_less<4>(4, vert, clipvert, clipVal);
+	int numverts = zclip_if_less<3>(4, vert, clipvert, clipVal);
 	if (numverts < 3)
 		return;
 
@@ -1734,11 +1731,6 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 
 		clipvert[i].x *= ooz;
 		clipvert[i].y *= ooz;
-		// Perspective-correct texturing: carry u/z, v/z and 1/z for the per-pixel divide.
-		clipvert[i].p[1] *= ooz;
-		clipvert[i].p[2] *= ooz;
-		clipvert[i].p[3] = ooz;
-
 		clipvert[i].x += xOrigin;
 		clipvert[i].y += yOrigin;
 		// The Grid adds zoffset for objects with no light
@@ -1769,6 +1761,30 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	extra.solidcolor = m_state->m_zeusbase[0x00] & 0x7fff;
 	// Flat solid-color fill: texmode bits 10-11 both set (same as Zeus 1)
 	extra.solid_enable = ((texmode & 0x0c00) == 0x0c00);
+
+	// Zeus interpolates texture across the whole quad: per-triangle affine creases at the
+	// diagonal, per-pixel correction is smoother than the hardware. Outline stored top-down.
+	extra.numedges = 0;
+	for (int i = 0; !extra.solid_enable && i < numverts && extra.numedges < int(std::size(extra.edge)); i++)
+	{
+		const z2_poly_vertex &va = clipvert[i];
+		const z2_poly_vertex &vb = clipvert[(i + 1 == numverts) ? 0 : i + 1];
+		const z2_poly_vertex &v0 = (va.y <= vb.y) ? va : vb;
+		const z2_poly_vertex &v1 = (va.y <= vb.y) ? vb : va;
+		float dy = v1.y - v0.y;
+		if (dy < 1e-5f)
+			continue;                   // horizontal edge
+		zeus2_edge &e = extra.edge[extra.numedges++];
+		float oody = 1.0f / dy;
+		e.ytop = v0.y;
+		e.ybot = v1.y;
+		e.x = v0.x;
+		e.u = v0.p[1];
+		e.v = v0.p[2];
+		e.dxdy = (v1.x - v0.x) * oody;
+		e.dudy = (v1.p[1] - v0.p[1]) * oody;
+		e.dvdy = (v1.p[2] - v0.p[2]) * oody;
+	}
 	extra.transcolor = (texmode & 0x180) ? 0 : 0x100;
 	extra.texbase = WAVERAM_BLOCK0_EXT(m_state->zeus_texbase);
 	extra.depth_min_enable = true;// (m_state->m_renderRegs[0x14] & 0x008000);
@@ -1812,7 +1828,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		break;
 	}
 
-	render_triangle_fan<4>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
+	render_triangle_fan<1>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }
 
 
@@ -1845,14 +1861,7 @@ static inline void zeus2_write_pixel(uint32_t &colorpix, int32_t &depthpix, rgb_
 void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, const zeus2_poly_extra_data& object, int threadid)
 {
 	int32_t curz = extent.param[0].start;
-	// Perspective-correct texturing: params 1/2 hold u/z and v/z, param 3 holds 1/z.
-	float curupz = extent.param[1].start;
-	float curvpz = extent.param[2].start;
-	float curooz = extent.param[3].start;
 	int32_t dzdx = extent.param[0].dpdx;
-	float dupzdx = extent.param[1].dpdx;
-	float dvpzdx = extent.param[2].dpdx;
-	float doozdx = extent.param[3].dpdx;
 	const void *texbase = object.texbase;
 	//const void *palbase = object.palbase;
 	uint16_t transcolor = object.transcolor;
@@ -1869,8 +1878,43 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 	uint32_t *colorptr = &m_state->m_frameColor[addr];
 	int32_t curDepthVal;
 
+	// u,v from the two edges this scanline crosses, then linear across the span. poly.h keeps
+	// every scanline centre inside [ymin, ymax), so both crossings always exist.
+	float curu_f = 0.0f, curv_f = 0.0f, dudx = 0.0f, dvdx = 0.0f;
+	if (!object.solid_enable)
+	{
+		const float yc = float(scanline) + 0.5f;
+		float xl = std::numeric_limits<float>::max(), xr = -xl;
+		float ul = 0.0f, vl = 0.0f, ur = 0.0f, vr = 0.0f;
+		for (int i = 0; i < object.numedges; i++)
+		{
+			const zeus2_edge &e = object.edge[i];
+			if (yc < e.ytop || yc >= e.ybot)
+				continue;
+			float dy = yc - e.ytop;
+			float ex = e.x + dy * e.dxdy;
+			if (ex < xl) { xl = ex; ul = e.u + dy * e.dudy; vl = e.v + dy * e.dvdy; }
+			if (ex > xr) { xr = ex; ur = e.u + dy * e.dudy; vr = e.v + dy * e.dvdy; }
+		}
+		if (xr > xl)
+		{
+			float oodx = 1.0f / (xr - xl);
+			dudx = (ur - ul) * oodx;
+			dvdx = (vr - vl) * oodx;
+			float startdx = float(extent.startx) + 0.5f - xl;
+			curu_f = ul + startdx * dudx;
+			curv_f = vl + startdx * dvdx;
+		}
+	}
+
 	for (x = extent.startx; x < extent.stopx; x++)
 	{
+		// Stepped whether or not the depth test passes.
+		int32_t curu = (int32_t)curu_f;
+		int32_t curv = (int32_t)curv_f;
+		curu_f += dudx;
+		curv_f += dvdx;
+
 		if (object.depth_clear_enable) {
 			//curDepthVal = object.zbuf_min;
 			curDepthVal = 0xffffff;
@@ -1892,10 +1936,6 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 				depth_pass = false;
 		}
 		if (depth_pass) {
-			// Perspective divide for texel coords; clamp guards the clipped near edge.
-			float oozInv = 1.0f / curooz;
-			int32_t curu = (int32_t)(curupz * oozInv);
-			int32_t curv = (int32_t)(curvpz * oozInv);
 			int u0 = (curu >> 8);
 			int v0 = (curv >> 8);
 			if (u0 < 0) u0 = 0;
@@ -1995,9 +2035,6 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			}
 		}
 		curz += dzdx;
-		curupz += dupzdx;
-		curvpz += dvpzdx;
-		curooz += doozdx;
 	}
 }
 

@@ -37,6 +37,14 @@
 *  Type definitions
 *************************************/
 
+// One projected polygon edge; the rasterizer walks these for its per-scanline u,v.
+struct zeus2_edge
+{
+	float           ytop, ybot;     // scanlines this edge spans
+	float           x, u, v;        // values at ytop
+	float           dxdy, dudy, dvdy;
+};
+
 struct zeus2_poly_extra_data
 {
 	const void *    palbase;
@@ -65,6 +73,10 @@ struct zeus2_poly_extra_data
 
 	uint8_t(*get_texel)(const void *, int, int, int);
 	uint8_t(*get_alpha)(const void *, int, int, int);
+
+	// Projected outline, non-horizontal edges only; a near-clipped quad is at most a 5-gon.
+	int             numedges;
+	zeus2_edge      edge[5];
 };
 
 /*************************************
@@ -95,7 +107,7 @@ struct zeus2_poly_extra_data
 *************************************/
 class zeus2_device;
 
-class zeus2_renderer : public poly_manager<float, zeus2_poly_extra_data, 4>
+class zeus2_renderer : public poly_manager<float, zeus2_poly_extra_data, 3>
 {
 public:
 	zeus2_renderer(zeus2_device *state);
