@@ -102,7 +102,9 @@ protected:
 	void zeus_w(offs_t offset, uint32_t data);
 
 	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
-	INTERRUPT_GEN_MEMBER(display_irq);
+	attotime time_until_display_irq();
+	void display_irq(int state);
+	void rearm_display_irq();
 	TIMER_CALLBACK_MEMBER(display_irq_off);
 
 	void zeus_map(address_map &map) ATTR_COLD;

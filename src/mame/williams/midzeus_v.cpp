@@ -723,6 +723,8 @@ void midzeus_state::zeus_register_update(offs_t offset)
 					m_zeus_cliprect.min_x = 0;
 				}
 			}
+			// re-time the display interrupt against the mode just programmed
+			rearm_display_irq();
 			break;
 
 		case 0xcc:

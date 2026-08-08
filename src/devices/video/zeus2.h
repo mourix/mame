@@ -136,10 +136,10 @@ public:
 	TIMER_CALLBACK_MEMBER(display_irq_off);
 	TIMER_CALLBACK_MEMBER(display_irq);
 
-	auto vblank_callback() { return m_vblank.bind(); }
+	auto vsync_callback() { return m_vsync.bind(); }
 	auto irq_callback() { return m_irq.bind(); }
 
-	devcb_write_line   m_vblank;
+	devcb_write_line   m_vsync;
 	devcb_write_line   m_irq;
 
 	void set_float_mode(int mode) { m_atlantis = mode; }
@@ -171,8 +171,8 @@ public:
 	uint32_t m_texmodeReg;
 
 	emu_timer *int_timer;
-	emu_timer *vblank_timer;
-	emu_timer *vblank_off_timer;
+	emu_timer *vsync_start_timer;
+	emu_timer *vsync_stop_timer;
 	int yoffs;
 	int texel_width;
 	float zbase;
@@ -193,6 +193,7 @@ protected:
 
 private:
 	TIMER_CALLBACK_MEMBER(int_timer_callback);
+	attotime time_until_line(uint32_t line, const attotime &fallback);
 	void zeus2_register32_w(offs_t offset, uint32_t data, int logit);
 	void zeus2_register_update(offs_t offset, uint32_t oldval, int logit);
 	bool zeus2_fifo_process(const uint32_t *data, int numwords);
