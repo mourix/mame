@@ -1551,95 +1551,107 @@ void zeus2_device::zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit
 	}
 }
 
-/*************************************
- *  Draw a quad
- *************************************/
-// Zeus names the first and last sample of a primitive, not its outer edges: a 128-texel tile
-// spans 127 units and an 8-texel glyph cell spans 7.  Its span walker starts at the rounded
-// edge and steps a pixel at a time, so both extremes land on a pixel and carry their vertex u,v.
+// Zeus names the first and last sample of a primitive, not its outer edges: a 128-texel tile spans
+// 127 units and an 8-texel glyph cell spans 7, so a span covers round(min)..round(max) inclusive.
+static float z2_poly_vertex::* const ZEUS_AXIS[2] = { &z2_poly_vertex::x, &z2_poly_vertex::y };
+
 static inline int32_t zeus_round_coord(float v)
 {
 	const float ip = floorf(v);
 	return int32_t(ip) + ((v - ip > 0.5f) ? 1 : 0);
 }
 
-// Breaks the tie on that last sample and nothing else.  Kept out of the u,v gradients: a span
-// that ends an epsilon late interpolates an epsilon short of its last texel, and every sample
-// then rounds down, which drops the texel instead of drawing it.
+// poly.h's extent is half-open, so the last sample needs the maximum pushed just past it.  It must
+// not reach the u,v gradients: a span ending an epsilon late interpolates an epsilon short of its
+// last texel, every sample then rounds down, and the texel is dropped instead of drawn.
 static constexpr float SAMPLE_EPSILON = 1.0f / 256.0f;
 
-// Snapping the outline only reproduces that walk while the side edges are vertical and every
-// scanline spans the same pixels.  Sloped geometry starts somewhere else on each scanline, and
-// stretching its outline to the grid tears the road apart.
-// Only a quad from a 2D pass is snapped, and they are exactly axis-aligned.  Measured over
-// 770k quads in all three games, the lean histogram is bimodal with an empty decade between
-// 1e-4 (float noise on a genuinely axis-aligned quad) and 1e-3 (the flattest projected 3D, e.g.
-// thegrid's TV-screen grid at 0.006).  Put the threshold in that gap: too tight and noise
-// declares a 2D quad sloped, too loose and one row of a 3D grid snaps on its own.
+// Snapping reproduces that walk only while the side edges are vertical; stretching a sloped outline
+// to the grid tears the road apart.  The threshold sits in the empty decade of the measured lean
+// histogram - 2D quads fall below 1e-4, the flattest projected 3D leans 6e-3.
 static constexpr float ALIGN_TOLERANCE = 1.0f / 4096.0f;
 
-static bool zeus_screen_aligned(const z2_poly_vertex *vert, int numverts)
+// Remap an axis-aligned quad so its extremes land on the pixels the span walker would have started
+// and finished on, and its u,v on the texel centres those samples read.  A quad that z-clipping has
+// turned into a fan, or that leans, is left alone.
+static bool zeus_snap_quad(z2_poly_vertex *vert, int numverts)
 {
 	if (numverts != 4)
 		return false;
-	float xlo = vert[0].x, xhi = xlo, ylo = vert[0].y, yhi = ylo;
-	for (int i = 1; i < numverts; i++)
+
+	float lo[2], hi[2];
+	for (int a = 0; a < 2; a++)
 	{
-		xlo = std::min(xlo, vert[i].x); xhi = std::max(xhi, vert[i].x);
-		ylo = std::min(ylo, vert[i].y); yhi = std::max(yhi, vert[i].y);
+		lo[a] = hi[a] = vert[0].*ZEUS_AXIS[a];
+		for (int i = 1; i < numverts; i++)
+		{
+			lo[a] = std::min(lo[a], vert[i].*ZEUS_AXIS[a]);
+			hi[a] = std::max(hi[a], vert[i].*ZEUS_AXIS[a]);
+		}
+		for (int i = 0; i < numverts; i++)
+			if (vert[i].*ZEUS_AXIS[a] > lo[a] + ALIGN_TOLERANCE && vert[i].*ZEUS_AXIS[a] < hi[a] - ALIGN_TOLERANCE)
+				return false;
 	}
-	for (int i = 0; i < numverts; i++)
+
+	for (int a = 0; a < 2; a++)
 	{
-		if (vert[i].x > xlo + ALIGN_TOLERANCE && vert[i].x < xhi - ALIGN_TOLERANCE)
-			return false;
-		if (vert[i].y > ylo + ALIGN_TOLERANCE && vert[i].y < yhi - ALIGN_TOLERANCE)
-			return false;
+		const int32_t ilo = zeus_round_coord(lo[a]), ihi = zeus_round_coord(hi[a]);
+		const float span = hi[a] - lo[a];
+		const float scale = (ihi > ilo && span > 1e-4f) ? (float(ihi - ilo) / span) : 1.0f;
+		const float bias = float(ilo) + 0.5f - lo[a] * scale;
+		for (int i = 0; i < numverts; i++)
+			vert[i].*ZEUS_AXIS[a] = vert[i].*ZEUS_AXIS[a] * scale + bias;
+	}
+
+	// The games place a 2D span's u either on a texel centre (The Grid) or on its index (Cruis'n);
+	// only the centre survives the half-texel sampling bias, so shift the span onto it.
+	for (int prm = 1; prm <= 2; prm++)
+	{
+		float tlo = vert[0].p[prm];
+		for (int i = 1; i < numverts; i++)
+			tlo = std::min(tlo, vert[i].p[prm]);
+		const float d = (floorf(tlo / 256.0f) + 0.5f) * 256.0f - tlo;
+		for (int i = 0; i < numverts; i++)
+			vert[i].p[prm] += d;
 	}
 	return true;
 }
 
-// Remap one axis so its extremes land on the pixels the span walker would have started and
-// finished on.
-static void zeus_snap_axis(z2_poly_vertex *vert, int numverts, float z2_poly_vertex::*axis)
+// Call only after the edge table is built: the epsilon must reach poly.h's coverage, never the u,v
+// gradients read from these same vertices.
+static void zeus_widen_quad(z2_poly_vertex *vert, int numverts)
 {
-	float lo = vert[0].*axis, hi = lo;
-	for (int i = 1; i < numverts; i++)
+	for (int a = 0; a < 2; a++)
 	{
-		lo = std::min(lo, vert[i].*axis);
-		hi = std::max(hi, vert[i].*axis);
+		float hi = vert[0].*ZEUS_AXIS[a];
+		for (int i = 1; i < numverts; i++)
+			hi = std::max(hi, vert[i].*ZEUS_AXIS[a]);
+		for (int i = 0; i < numverts; i++)
+			if (vert[i].*ZEUS_AXIS[a] > hi - SAMPLE_EPSILON)
+				vert[i].*ZEUS_AXIS[a] += SAMPLE_EPSILON;
 	}
-	const int32_t ilo = zeus_round_coord(lo), ihi = zeus_round_coord(hi);
-	const float span = hi - lo;
-	const float scale = (ihi > ilo && span > 1e-4f) ? (float(ihi - ilo) / span) : 1.0f;
-	const float bias = float(ilo) + 0.5f - lo * scale;
-	for (int i = 0; i < numverts; i++)
-		vert[i].*axis = vert[i].*axis * scale + bias;
 }
 
-// A quad snapped to the pixel grid samples texel centres: the games place a 2D span's u either on
-// a texel centre (The Grid) or on its index (Cruis'n), and only the centre survives the half-texel
-// bias.  Shift the whole span onto the centre so both read the texel the artist drew.
-static void zeus_snap_texel(z2_poly_vertex *vert, int numverts, int param)
+// The colour key tests the nearest tap, not the whole filter footprint: u,v index a texel rather
+// than measuring from the texture edge, so under magnification a guard texel would otherwise eat a
+// whole column.  Keyed taps take the drawn texel so the filter stays on it.  Ties round down.
+static inline bool zeus_apply_color_key(uint8_t &t0, uint8_t &t1, uint8_t &t2, uint8_t &t3,
+	int32_t curu, int32_t curv, uint16_t transcolor)
 {
-	float lo = vert[0].p[param];
-	for (int i = 1; i < numverts; i++)
-		lo = std::min(lo, vert[i].p[param]);
-	const float d = (floorf(lo / 256.0f) + 0.5f) * 256.0f - lo;
-	for (int i = 0; i < numverts; i++)
-		vert[i].p[param] += d;
+	const bool ur = (curu & 0xff) > 0x80, vr = (curv & 0xff) > 0x80;
+	const uint8_t nearest = vr ? (ur ? t3 : t2) : (ur ? t1 : t0);
+	if (nearest == transcolor)
+		return false;
+	if (t0 == transcolor) t0 = nearest;
+	if (t1 == transcolor) t1 = nearest;
+	if (t2 == transcolor) t2 = nearest;
+	if (t3 == transcolor) t3 = nearest;
+	return true;
 }
 
-// poly.h's extent is half-open, so the last sample needs the maximum edge pushed past it.
-static void zeus_widen_axis(z2_poly_vertex *vert, int numverts, float z2_poly_vertex::*axis)
-{
-	float hi = vert[0].*axis;
-	for (int i = 1; i < numverts; i++)
-		hi = std::max(hi, vert[i].*axis);
-	for (int i = 0; i < numverts; i++)
-		if (vert[i].*axis > hi - SAMPLE_EPSILON)
-			vert[i].*axis += SAMPLE_EPSILON;
-}
-
+/*************************************
+ *  Draw a quad
+ *************************************/
 void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdata, int logit)
 {
 	z2_poly_vertex vert[4];
@@ -1844,14 +1856,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 			return;
 	}
 
-	const bool snapped = zeus_screen_aligned(clipvert, numverts);
-	if (snapped)
-	{
-		zeus_snap_axis(clipvert, numverts, &z2_poly_vertex::x);
-		zeus_snap_axis(clipvert, numverts, &z2_poly_vertex::y);
-		zeus_snap_texel(clipvert, numverts, 1);
-		zeus_snap_texel(clipvert, numverts, 2);
-	}
+	const bool snapped = zeus_snap_quad(clipvert, numverts);
 
 	zeus2_poly_extra_data& extra = this->object_data().next();
 
@@ -1932,10 +1937,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	}
 
 	if (snapped)
-	{
-		zeus_widen_axis(clipvert, numverts, &z2_poly_vertex::x);
-		zeus_widen_axis(clipvert, numverts, &z2_poly_vertex::y);
-	}
+		zeus_widen_quad(clipvert, numverts);
 
 	render_triangle_fan<1>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }
@@ -1974,6 +1976,8 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 	const void *texbase = object.texbase;
 	//const void *palbase = object.palbase;
 	uint16_t transcolor = object.transcolor;
+	const bool keyed = (transcolor != 0x100);   // 0x100 cannot match a texel, so nothing is keyed
+	const int32_t zbuf_min = object.zbuf_min;
 	int32_t srcAlpha = object.srcAlpha;
 	int32_t dstAlpha = object.dstAlpha;
 	bool depth_write_enable = object.depth_write_enable;
@@ -2030,15 +2034,14 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			//curDepthVal = object.zbuf_min;
 			curDepthVal = 0xffffff;
 		} else if (object.depth_min_enable) {
-			curDepthVal = curz + object.zbuf_min;
+			// Render reg 0x15 is a floor on the depth value, not a per-object bias: adding it
+			// inverts the ordering of two surfaces whose own z already separates them, which
+			// drops the nearer one along the line where they meet.
+			curDepthVal = std::max(curz, zbuf_min);
 		}
 		else {
 			curDepthVal = curz;
 		}
-		//if (curz < object.zbuf_min)
-		//  curDepthVal = object.zbuf_min;
-		//else
-		//  curDepthVal = curz;
 		if (curDepthVal < 0)
 			curDepthVal = 0;
 		bool depth_pass = true;
@@ -2120,18 +2123,8 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 				uint8_t texel1 = object.get_texel(texbase, v0, u1, texwidth);
 				uint8_t texel2 = object.get_texel(texbase, v1, u0, texwidth);
 				uint8_t texel3 = object.get_texel(texbase, v1, u1, texwidth);
-				// u,v index a texel rather than measuring from the texture edge, so the key is
-				// the nearest tap, not the whole filter footprint - at 1:1 that is texel0, and
-				// under magnification it stops a guard texel eating a column.  Ties round down.
-				const bool ur = (curu & 0xff) > 0x80, vr = (curv & 0xff) > 0x80;
-				uint8_t &nearest = vr ? (ur ? texel3 : texel2) : (ur ? texel1 : texel0);
-				if (nearest != transcolor)
+				if (!keyed || zeus_apply_color_key(texel0, texel1, texel2, texel3, curu, curv, transcolor))
 				{
-					const uint8_t keep = nearest;
-					if (texel0 == transcolor) texel0 = keep;
-					if (texel1 == transcolor) texel1 = keep;
-					if (texel2 == transcolor) texel2 = keep;
-					if (texel3 == transcolor) texel3 = keep;
 					uint32_t color0 = m_state->m_pal_table[texel0];
 					uint32_t color1 = m_state->m_pal_table[texel1];
 					uint32_t color2 = m_state->m_pal_table[texel2];
