@@ -65,6 +65,8 @@ struct zeus2_poly_extra_data
 	bool            texture_rgb555;
 	bool            solid_enable;
 	bool            blend_enable;
+	bool            light_enable;
+	uint32_t        objLight;
 	int32_t         zbuf_min;
 	bool            depth_min_enable;
 	bool            depth_test_enable;
@@ -107,7 +109,7 @@ struct zeus2_poly_extra_data
 *************************************/
 class zeus2_device;
 
-class zeus2_renderer : public poly_manager<float, zeus2_poly_extra_data, 3>
+class zeus2_renderer : public poly_manager<float, zeus2_poly_extra_data, 4>
 {
 public:
 	zeus2_renderer(zeus2_device *state);
@@ -166,6 +168,10 @@ public:
 	std::unique_ptr<int32_t[]> m_frameDepth;
 	uint32_t m_pal_table[0x100];
 	uint32_t m_ucode[0x200];
+	uint32_t m_lightTable[0x80];
+	uint32_t m_lightTableBase;
+	uint32_t m_lightTableSize;
+	float m_normalScale;
 	uint32_t m_curUCodeSrc;
 	uint32_t m_curPalTableSrc;
 	uint32_t m_texmodeReg;
@@ -200,6 +206,7 @@ private:
 	void zeus2_pointer_write(uint8_t which, uint32_t value, int logit);
 	void load_pal_table(void *wavePtr, uint32_t ctrl, int type, int logit);
 	void load_ucode(void *wavePtr, uint32_t ctrl, int logit);
+	void load_light_table(void *wavePtr, uint32_t ctrl, int logit);
 	void zeus2_draw_model(uint32_t baseaddr, uint16_t count, int logit);
 	void log_fifo_command(const uint32_t *data, int numwords, const char *suffix);
 	void print_fifo_command(const uint32_t *data, int numwords, const char *suffix);

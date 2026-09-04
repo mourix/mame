@@ -22,7 +22,7 @@
 *  Constructor
 *************************************/
 zeus2_renderer::zeus2_renderer(zeus2_device *state)
-	: poly_manager<float, zeus2_poly_extra_data, 3>(state->machine())
+	: poly_manager<float, zeus2_poly_extra_data, 4>(state->machine())
 	, m_state(state)
 {
 }
@@ -118,6 +118,7 @@ void zeus2_device::device_start()
 	save_pointer(NAME(m_frameDepth), WAVERAM1_WIDTH * WAVERAM1_HEIGHT * 2);
 	save_item(NAME(m_pal_table));
 	// m_ucode
+	// m_lightTable
 	save_item(NAME(m_curUCodeSrc));
 	save_item(NAME(m_curPalTableSrc));
 	save_item(NAME(m_texmodeReg));
@@ -138,6 +139,8 @@ void zeus2_device::device_reset()
 {
 	memset(m_zeusbase, 0, sizeof(m_zeusbase[0]) * 0x80);
 	memset(m_renderRegs, 0, sizeof(m_renderRegs[0]) * 0x50);
+	m_lightTableBase = m_lightTableSize = 0;
+	m_normalScale = 0.0f;
 
 	m_curUCodeSrc = 0;
 	m_curPalTableSrc = 0;
@@ -627,12 +630,11 @@ void zeus2_device::zeus2_register_update(offs_t offset, uint32_t oldval, int log
 				// Load ucode from waveram
 				poly->wait("UCODE_LOAD");
 				void *dataPtr = waveram0_ptr_from_expanded_addr(m_zeusbase[0x41]);
-				load_ucode(dataPtr, m_zeusbase[0x40], logit);
 				if (((m_zeusbase[0x40] >> 24) & 0xff) >= 0xc0) {
-					// Light table load
-					if (logit) logerror("\t-- light table loaded");
+					load_light_table(dataPtr, m_zeusbase[0x40], logit);
 				}
 				else {
+					load_ucode(dataPtr, m_zeusbase[0x40], logit);
 					m_curUCodeSrc = m_zeusbase[0x41];
 					m_useZOffset = false;
 					// Zeus Quad Size
@@ -1023,6 +1025,22 @@ void zeus2_device::load_pal_table(void *wavePtr, uint32_t ctrl, int type, int lo
 		logerror("\n");
 	}
 }
+// Pages 0xc0 and up are float data, not code.  They share the ucode load path but not its
+// storage: at 2 words per instruction the base program already fills m_ucode exactly, so a
+// table written there overwrites its last 64 instructions.
+void zeus2_device::load_light_table(void *wavePtr, uint32_t ctrl, int logit)
+{
+	uint32_t const count = ctrl & 0xffff;
+	uint32_t const addr = (((ctrl >> 24) & 0xff) - 0xc0) << 1;
+	uint32_t const *src = (uint32_t *)wavePtr;
+	for (uint32_t i = 0; i <= count * 2 + 1 && addr + i < std::size(m_lightTable); i++)
+		m_lightTable[addr + i] = src[i];
+	m_lightTableBase = addr;
+	m_lightTableSize = (count + 1) * 2;
+	if (logit)
+		logerror("\t-- light table loaded");
+}
+
 /*************************************
 *  Load microcode from waveram
 *************************************/
@@ -1605,7 +1623,7 @@ static bool zeus_snap_quad(z2_poly_vertex *vert, int numverts)
 
 	// The games place a 2D span's u either on a texel centre (The Grid) or on its index (Cruis'n);
 	// only the centre survives the half-texel sampling bias, so shift the span onto it.
-	for (int prm = 1; prm <= 2; prm++)
+	for (int prm = 2; prm <= 3; prm++)
 	{
 		float tlo = vert[0].p[prm];
 		for (int i = 1; i < numverts; i++)
@@ -1692,52 +1710,52 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		vert[0].x = (int16_t)databuffer[2];
 		vert[0].y = (int16_t)databuffer[3];
 		vert[0].p[0] = (int16_t)databuffer[4];
-		vert[0].p[1] = ((databuffer[5] >> 0) & 0xff);
-		vert[0].p[2] = ((databuffer[5] >> 8) & 0xff);
+		vert[0].p[2] = ((databuffer[5] >> 0) & 0xff);
+		vert[0].p[3] = ((databuffer[5] >> 8) & 0xff);
 
 		vert[1].x = (int16_t)(databuffer[2] >> 16);
 		vert[1].y = (int16_t)(databuffer[3] >> 16);
 		vert[1].p[0] = (int16_t)(databuffer[4] >> 16);
-		vert[1].p[1] = ((databuffer[5] >> 16) & 0xff);
-		vert[1].p[2] = ((databuffer[5] >> 24) & 0xff);
+		vert[1].p[2] = ((databuffer[5] >> 16) & 0xff);
+		vert[1].p[3] = ((databuffer[5] >> 24) & 0xff);
 
 		vert[2].x = (int16_t)databuffer[6];
 		vert[2].y = (int16_t)databuffer[7];
 		vert[2].p[0] = (int16_t)databuffer[8];
-		vert[2].p[1] = ((databuffer[9] >> 0) & 0xff);
-		vert[2].p[2] = ((databuffer[9] >> 8) & 0xff);
+		vert[2].p[2] = ((databuffer[9] >> 0) & 0xff);
+		vert[2].p[3] = ((databuffer[9] >> 8) & 0xff);
 
 		vert[3].x = (int16_t)(databuffer[6] >> 16);
 		vert[3].y = (int16_t)(databuffer[7] >> 16);
 		vert[3].p[0] = (int16_t)(databuffer[8] >> 16);
-		vert[3].p[1] = ((databuffer[9] >> 16) & 0xff);
-		vert[3].p[2] = ((databuffer[9] >> 24) & 0xff);
+		vert[3].p[2] = ((databuffer[9] >> 16) & 0xff);
+		vert[3].p[3] = ((databuffer[9] >> 24) & 0xff);
 	}
 	else {
 		//printf("R40: %06X\n", m_state->m_renderRegs[0x40]);
 		vert[0].x = (int16_t)databuffer[2];
 		vert[0].y = (int16_t)databuffer[3];
 		vert[0].p[0] = (int16_t)databuffer[6];
-		vert[0].p[1] = (databuffer[1] >> 0) & 0x3ff;
-		vert[0].p[2] = (databuffer[1] >> 16) & 0x3ff;
+		vert[0].p[2] = (databuffer[1] >> 0) & 0x3ff;
+		vert[0].p[3] = (databuffer[1] >> 16) & 0x3ff;
 
 		vert[1].x = (int16_t)(databuffer[2] >> 16);
 		vert[1].y = (int16_t)(databuffer[3] >> 16);
 		vert[1].p[0] = (int16_t)(databuffer[6] >> 16);
-		vert[1].p[1] = (databuffer[4] >> 0) & 0x3ff;
-		vert[1].p[2] = (databuffer[4] >> 10) & 0x3ff;
+		vert[1].p[2] = (databuffer[4] >> 0) & 0x3ff;
+		vert[1].p[3] = (databuffer[4] >> 10) & 0x3ff;
 
 		vert[2].x = (int16_t)databuffer[8];
 		vert[2].y = (int16_t)databuffer[9];
 		vert[2].p[0] = (int16_t)databuffer[7];
-		vert[2].p[1] = (databuffer[4] >> 20) & 0x3ff;
-		vert[2].p[2] = (databuffer[5] >> 0) & 0x3ff;
+		vert[2].p[2] = (databuffer[4] >> 20) & 0x3ff;
+		vert[2].p[3] = (databuffer[5] >> 0) & 0x3ff;
 
 		vert[3].x = (int16_t)(databuffer[8] >> 16);
 		vert[3].y = (int16_t)(databuffer[9] >> 16);
 		vert[3].p[0] = (int16_t)(databuffer[7] >> 16);
-		vert[3].p[1] = (databuffer[5] >> 10) & 0x3ff;
-		vert[3].p[2] = (databuffer[5] >> 20) & 0x3ff;
+		vert[3].p[2] = (databuffer[5] >> 10) & 0x3ff;
+		vert[3].p[3] = (databuffer[5] >> 20) & 0x3ff;
 	}
 	int unknown[8];
 	float unknownFloat[4];
@@ -1787,18 +1805,67 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		vert[i].y += m_state->zeus_trans[1];
 		vert[i].p[0] += m_state->zeus_trans[2];
 
-		//vert[i].p[1] += ((texdata >> 8) & 0x1) ? 1.0f : 0.0f;
-		vert[i].p[1] *= uvScale;
+		vert[i].p[1] = 256.0f;      // unity; the lit paths below overwrite it
+		//vert[i].p[2] += ((texdata >> 8) & 0x1) ? 1.0f : 0.0f;
 		vert[i].p[2] *= uvScale;
-		vert[i].p[2] += (texdata >> 16);
-		vert[i].p[1] *= 256.0f;
+		vert[i].p[3] *= uvScale;
+		vert[i].p[3] += (texdata >> 16);
 		vert[i].p[2] *= 256.0f;
+		vert[i].p[3] *= 256.0f;
 
 		if (logextra & logit)
 		{
 			m_state->logerror("\t\t(%f,%f,%f) (%02X,%02X)\n",
 				(double)vert[i].x, (double)vert[i].y, (double)vert[i].p[0],
-				(int)(vert[i].p[1] / 256.0f), (int)(vert[i].p[2] / 256.0f));
+				(int)(vert[i].p[2] / 256.0f), (int)(vert[i].p[3] / 256.0f));
+		}
+	}
+	// Quad size 14 carries a per-vertex normal: two 3x10 signed normals share each 64-bit model
+	// word, interleaved by component.  The table is the game's whole shading curve, indexed by the
+	// cosine over its signed range - thegrid's ambient floor ends at cos 0, which fixes that scale.
+	if (m_state->zeus_quad_size == 14 && m_state->m_lightTableSize)
+	{
+		float const *lv = m_state->zeus_light;
+		float const llen = sqrtf(lv[0] * lv[0] + lv[1] * lv[1] + lv[2] * lv[2]);
+		int const half = m_state->m_lightTableSize / 2;
+		if (llen > 0.0f)
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				uint32_t const lo = databuffer[10 + (i & 2)], hi = databuffer[11 + (i & 2)];
+				float const nx = (i & 1) ? util::sext(lo >> 10, 10) : util::sext(lo, 10);
+				float const ny = (i & 1) ? util::sext(hi, 10)       : util::sext(lo >> 20, 10);
+				float const nz = (i & 1) ? util::sext(hi >> 20, 10) : util::sext(hi >> 10, 10);
+				float const vx = nx * m_state->zeus_matrix[0][0] + ny * m_state->zeus_matrix[0][1] + nz * m_state->zeus_matrix[0][2];
+				float const vy = nx * m_state->zeus_matrix[1][0] + ny * m_state->zeus_matrix[1][1] + nz * m_state->zeus_matrix[1][2];
+				float const vz = nx * m_state->zeus_matrix[2][0] + ny * m_state->zeus_matrix[2][1] + nz * m_state->zeus_matrix[2][2];
+				float const vlen = sqrtf(vx * vx + vy * vy + vz * vz);
+				if (vlen == 0.0f)
+					continue;
+				float const cosang = (vx * lv[0] + vy * lv[1] + vz * lv[2]) / (vlen * llen);
+				int const idx = std::clamp(int(floorf(cosang * half + 0.5f)), -half, half - 1);
+				uint32_t const ent = m_state->m_lightTable[m_state->m_lightTableBase + (idx & (m_state->m_lightTableSize - 1))];
+				// The dot is taken on the raw normal, so the table shares that fixed point: the
+				// normal's magnitude is unity.  Measured against hardware - crusnexo's attract car
+				// wants 511, thegrid's arena 256, each its own normal scale.
+				float const nlen = sqrtf(nx * nx + ny * ny + nz * nz);
+				if (nlen > 0.0f)
+				{
+					m_state->m_normalScale = nlen;
+					vert[i].p[1] = reinterpret_cast<float const &>(ent) * 256.0f / nlen;
+				}
+			}
+		}
+	}
+	// Quad size 12 carries the light the game baked itself, one 10-bit value per vertex at bits 0
+	// and 16 of the two words.  It is in the same units the table emits - crusnexo runs both paths
+	// and their medians agree to 0.4 % - so it takes the same unity.
+	if (m_state->zeus_quad_size == 12 && m_state->m_normalScale > 0.0f)
+	{
+		for (int i = 0; i < 4; i++)
+		{
+			uint32_t const v = (databuffer[10 + (i >> 1)] >> ((i & 1) ? 16 : 0)) & 0x3ff;
+			vert[i].p[1] = float(v) * 256.0f / m_state->m_normalScale;
 		}
 	}
 	if (0 && logextra & logit && m_state->zeus_quad_size == 14) {
@@ -1811,7 +1878,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	// crusnexo road segment), matching the Zeus 1 renderer.
 	float clipVal = reinterpret_cast<float&>(m_state->m_zeusbase[0x78]);
 	z2_poly_vertex clipvert[8];
-	int numverts = zclip_if_less<3>(4, vert, clipvert, clipVal);
+	int numverts = zclip_if_less<4>(4, vert, clipvert, clipVal);
 	if (numverts < 3)
 		return;
 
@@ -1887,12 +1954,20 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		e.ytop = v0.y;
 		e.ybot = v1.y + SAMPLE_EPSILON;
 		e.x = v0.x;
-		e.u = v0.p[1];
-		e.v = v0.p[2];
+		e.u = v0.p[2];
+		e.v = v0.p[3];
 		e.dxdy = (v1.x - v0.x) * oody;
-		e.dudy = (v1.p[1] - v0.p[1]) * oody;
-		e.dvdy = (v1.p[2] - v0.p[2]) * oody;
+		e.dudy = (v1.p[2] - v0.p[2]) * oody;
+		e.dvdy = (v1.p[3] - v0.p[3]) * oody;
 	}
+	// Object light colour (R0B, "Pixel ALU IntB"): three 8-bit lanes added after the light
+	// multiply.  Read as a scale instead, mwskins' 00000D would black out red and green.
+	// Only The Grid demonstrably uses it - it alone varies the register per object, 404040 on
+	// its characters against 000000 on the arena - and R40 bit 0x800000 is set on exactly those
+	// quads.  crusnexo holds R0B at zero and mwskins at a constant 00000D that nothing here
+	// shows is consumed, so both stay untouched.
+	extra.light_enable = ((m_state->m_renderRegs[0x40] & 0x800000) != 0);
+	extra.objLight = m_state->m_renderRegs[0x0b];
 	extra.transcolor = (texmode & 0x180) ? 0 : 0x100;
 	extra.texbase = WAVERAM_BLOCK0_EXT(m_state->zeus_texbase);
 	extra.depth_min_enable = true;// (m_state->m_renderRegs[0x14] & 0x008000);
@@ -1939,7 +2014,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 	if (snapped)
 		zeus_widen_quad(clipvert, numverts);
 
-	render_triangle_fan<1>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
+	render_triangle_fan<2>(m_state->zeus_cliprect, render_delegate(&zeus2_renderer::render_poly_8bit, this), numverts, clipvert);
 }
 
 
@@ -1950,8 +2025,18 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 
 // Blend srcColor into a frame buffer pixel and update depth; shared by the solid-fill and textured paths.
 static inline void zeus2_write_pixel(uint32_t &colorpix, int32_t &depthpix, rgb_t srcColor,
-	bool blend_enable, int32_t srcAlpha, int32_t dstAlpha, bool depth_write_enable, int32_t depthVal)
+	int32_t intensity, uint32_t objLight, bool blend_enable, int32_t srcAlpha, int32_t dstAlpha, bool depth_write_enable, int32_t depthVal)
 {
+	// Not scale8(): the light tables reach 2.8x (crusnexo) and 3.8x (mwskins) of unity, so the
+	// intensity has to be able to brighten as well as darken, and saturate per channel.
+	if (intensity != 0x100)
+		srcColor = rgb_t(std::min(255, (srcColor.r() * intensity) >> 8),
+			std::min(255, (srcColor.g() * intensity) >> 8),
+			std::min(255, (srcColor.b() * intensity) >> 8));
+	if (objLight)
+		srcColor = rgb_t(std::min(255, srcColor.r() + int((objLight >> 16) & 0xff)),
+			std::min(255, srcColor.g() + int((objLight >> 8) & 0xff)),
+			std::min(255, srcColor.b() + int(objLight & 0xff)));
 	if (blend_enable) {
 		// If src alpha is 0 don't write
 		if (srcAlpha == 0x00)
@@ -1973,6 +2058,11 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 {
 	int32_t curz = extent.param[0].start;
 	int32_t dzdx = extent.param[0].dpdx;
+	// light intensity, carried at 8 extra fractional bits so a shallow gradient does not
+	// truncate to a constant; curi >> 8 is the pixel ALU's own 0x100 = 1.0 scale
+	uint32_t const objLight = object.light_enable ? object.objLight : 0;
+	int32_t curi = int32_t(extent.param[1].start * 256.0f);
+	int32_t const didx = int32_t(extent.param[1].dpdx * 256.0f);
 	const void *texbase = object.texbase;
 	//const void *palbase = object.palbase;
 	uint16_t transcolor = object.transcolor;
@@ -2057,7 +2147,7 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			int u1 = (u0 + 1);
 			int v1 = (v0 + 1);
 			if (object.solid_enable) {
-				zeus2_write_pixel(colorptr[x], depthptr[x], solidColor, object.blend_enable,
+				zeus2_write_pixel(colorptr[x], depthptr[x], solidColor, (curi + 0x80) >> 8, objLight, object.blend_enable,
 					srcAlpha, dstAlpha, depth_write_enable, curDepthVal);
 			}
 			else if (object.texture_rgb555) {
@@ -2130,7 +2220,7 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 					uint32_t color2 = m_state->m_pal_table[texel2];
 					uint32_t color3 = m_state->m_pal_table[texel3];
 					rgb_t srcColor = rgbaint_t::bilinear_filter(color0, color1, color2, color3, curu, curv);
-					zeus2_write_pixel(colorptr[x], depthptr[x], srcColor, object.blend_enable,
+					zeus2_write_pixel(colorptr[x], depthptr[x], srcColor, (curi + 0x80) >> 8, objLight, object.blend_enable,
 						srcAlpha, dstAlpha, depth_write_enable, curDepthVal);
 				}
 			// Rendering for textures with transparent color
@@ -2148,6 +2238,7 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			}
 		}
 		curz += dzdx;
+		curi += didx;
 	}
 }
 
