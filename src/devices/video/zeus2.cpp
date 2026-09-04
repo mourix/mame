@@ -140,7 +140,11 @@ void zeus2_device::device_reset()
 	memset(m_zeusbase, 0, sizeof(m_zeusbase[0]) * 0x80);
 	memset(m_renderRegs, 0, sizeof(m_renderRegs[0]) * 0x50);
 	m_lightTableBase = m_lightTableSize = 0;
-	m_normalScale = 0.0f;
+	m_zoffset = m_staticFade[0] = m_staticFade[1] = 0.0f;
+	// Static light shares the dynamic path's unity, which is measured from a vertex normal - but a
+	// model with baked light can be drawn before any that carries one, and after every state load.
+	// Seed it per game so that never leaves a scene unlit; a normal-bearing quad refines it.
+	m_normalScale = (m_system == THEGRID) ? 256.0f : 511.0f;
 
 	m_curUCodeSrc = 0;
 	m_curPalTableSrc = 0;
@@ -1305,13 +1309,13 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 			if (m_system == THEGRID) {
 				if (numwords < 3)
 					return false;
-				zeus_light[1] = convert_float(data[1]);
-				zeus_light[2] = convert_float(data[2]);
+				m_staticFade[0] = convert_float(data[1]);
+				m_staticFade[1] = convert_float(data[2]);
 				if (log_fifo)
 				{
 					log_fifo_command(data, numwords, " -- Set static fade\n");
-					logerror("\t\tlight_vector %8.2f %8.2f %8.2f\n",
-						(double)zeus_light[0], (double)zeus_light[1], (double)zeus_light[2]);
+					logerror("\t\tstatic_fade %8.2f %8.2f\n",
+						(double)m_staticFade[0], (double)m_staticFade[1]);
 				}
 				break;
 			}
@@ -1338,7 +1342,7 @@ bool zeus2_device::zeus2_fifo_process(const uint32_t *data, int numwords)
 		case 0x1d:
 			if (numwords < 2)
 				return false;
-			zeus_light[2] = convert_float(data[1]);
+			m_zoffset = convert_float(data[1]);
 			if (log_fifo)
 			{
 				log_fifo_command(data, numwords, " -- Set zoffset\n");
@@ -1906,9 +1910,9 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		clipvert[i].y *= ooz;
 		clipvert[i].x += xOrigin;
 		clipvert[i].y += yOrigin;
-		// The Grid adds zoffset for objects with no light
+		// The Grid adds its own zoffset (cmd 0x1d) for objects with no light
 		if (m_state->m_useZOffset)
-			clipvert[i].p[0] += m_state->zeus_light[2];
+			clipvert[i].p[0] += m_state->m_zoffset;
 
 		clipvert[i].p[0] *= 4096.0f;  // 12.12
 
@@ -1960,14 +1964,6 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 		e.dudy = (v1.p[2] - v0.p[2]) * oody;
 		e.dvdy = (v1.p[3] - v0.p[3]) * oody;
 	}
-	// Object light colour (R0B, "Pixel ALU IntB"): three 8-bit lanes added after the light
-	// multiply.  Read as a scale instead, mwskins' 00000D would black out red and green.
-	// Only The Grid demonstrably uses it - it alone varies the register per object, 404040 on
-	// its characters against 000000 on the arena - and R40 bit 0x800000 is set on exactly those
-	// quads.  crusnexo holds R0B at zero and mwskins at a constant 00000D that nothing here
-	// shows is consumed, so both stay untouched.
-	extra.light_enable = ((m_state->m_renderRegs[0x40] & 0x800000) != 0);
-	extra.objLight = m_state->m_renderRegs[0x0b];
 	extra.transcolor = (texmode & 0x180) ? 0 : 0x100;
 	extra.texbase = WAVERAM_BLOCK0_EXT(m_state->zeus_texbase);
 	extra.depth_min_enable = true;// (m_state->m_renderRegs[0x14] & 0x008000);
@@ -2025,7 +2021,7 @@ void zeus2_renderer::zeus2_draw_quad(const uint32_t *databuffer, uint32_t texdat
 
 // Blend srcColor into a frame buffer pixel and update depth; shared by the solid-fill and textured paths.
 static inline void zeus2_write_pixel(uint32_t &colorpix, int32_t &depthpix, rgb_t srcColor,
-	int32_t intensity, uint32_t objLight, bool blend_enable, int32_t srcAlpha, int32_t dstAlpha, bool depth_write_enable, int32_t depthVal)
+	int32_t intensity, bool blend_enable, int32_t srcAlpha, int32_t dstAlpha, bool depth_write_enable, int32_t depthVal)
 {
 	// Not scale8(): the light tables reach 2.8x (crusnexo) and 3.8x (mwskins) of unity, so the
 	// intensity has to be able to brighten as well as darken, and saturate per channel.
@@ -2033,10 +2029,6 @@ static inline void zeus2_write_pixel(uint32_t &colorpix, int32_t &depthpix, rgb_
 		srcColor = rgb_t(std::min(255, (srcColor.r() * intensity) >> 8),
 			std::min(255, (srcColor.g() * intensity) >> 8),
 			std::min(255, (srcColor.b() * intensity) >> 8));
-	if (objLight)
-		srcColor = rgb_t(std::min(255, srcColor.r() + int((objLight >> 16) & 0xff)),
-			std::min(255, srcColor.g() + int((objLight >> 8) & 0xff)),
-			std::min(255, srcColor.b() + int(objLight & 0xff)));
 	if (blend_enable) {
 		// If src alpha is 0 don't write
 		if (srcAlpha == 0x00)
@@ -2060,7 +2052,6 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 	int32_t dzdx = extent.param[0].dpdx;
 	// light intensity, carried at 8 extra fractional bits so a shallow gradient does not
 	// truncate to a constant; curi >> 8 is the pixel ALU's own 0x100 = 1.0 scale
-	uint32_t const objLight = object.light_enable ? object.objLight : 0;
 	int32_t curi = int32_t(extent.param[1].start * 256.0f);
 	int32_t const didx = int32_t(extent.param[1].dpdx * 256.0f);
 	const void *texbase = object.texbase;
@@ -2147,7 +2138,7 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 			int u1 = (u0 + 1);
 			int v1 = (v0 + 1);
 			if (object.solid_enable) {
-				zeus2_write_pixel(colorptr[x], depthptr[x], solidColor, (curi + 0x80) >> 8, objLight, object.blend_enable,
+				zeus2_write_pixel(colorptr[x], depthptr[x], solidColor, (curi + 0x80) >> 8, object.blend_enable,
 					srcAlpha, dstAlpha, depth_write_enable, curDepthVal);
 			}
 			else if (object.texture_rgb555) {
@@ -2220,7 +2211,7 @@ void zeus2_renderer::render_poly_8bit(int32_t scanline, const extent_t& extent, 
 					uint32_t color2 = m_state->m_pal_table[texel2];
 					uint32_t color3 = m_state->m_pal_table[texel3];
 					rgb_t srcColor = rgbaint_t::bilinear_filter(color0, color1, color2, color3, curu, curv);
-					zeus2_write_pixel(colorptr[x], depthptr[x], srcColor, (curi + 0x80) >> 8, objLight, object.blend_enable,
+					zeus2_write_pixel(colorptr[x], depthptr[x], srcColor, (curi + 0x80) >> 8, object.blend_enable,
 						srcAlpha, dstAlpha, depth_write_enable, curDepthVal);
 				}
 			// Rendering for textures with transparent color

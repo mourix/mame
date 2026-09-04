@@ -65,8 +65,6 @@ struct zeus2_poly_extra_data
 	bool            texture_rgb555;
 	bool            solid_enable;
 	bool            blend_enable;
-	bool            light_enable;
-	uint32_t        objLight;
 	int32_t         zbuf_min;
 	bool            depth_min_enable;
 	bool            depth_test_enable;
@@ -158,6 +156,8 @@ public:
 	float zeus_matrix[3][3];
 	float zeus_trans[4];
 	float zeus_light[3];
+	float m_zoffset;       // thegrid cmd 0x1d - a depth bias, not the light's z
+	float m_staticFade[2]; // thegrid cmd 0x1c - unconsumed, but it must not land in zeus_light
 	uint32_t zeus_texbase;
 	int zeus_quad_size;
 	bool m_useZOffset;
